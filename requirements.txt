@@ -1,6 +1,6 @@
-numpy
+numpy>=1.13
 scipy
-git+https://github.com/roger-/pyrtlsdr.git@master#egg=pyrtlsdr
+pyrtlsdr
 tinydb
-ujson
-kivy
+json-object-factory
+PySide2>=5.13.1

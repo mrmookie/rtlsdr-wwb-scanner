@@ -1,9 +1,11 @@
 import os
+import io
 import datetime
 import uuid
-from StringIO import StringIO
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
+
+import numpy as np
 
 EPOCH = datetime.datetime(1970, 1, 1)
 
@@ -49,6 +51,13 @@ class BaseExporter(object):
         with open(self.filename, 'w') as f:
             f.write(s)
 
+class NumpyExporter(BaseExporter):
+    _extension = 'npz'
+    def build_data(self):
+        pass
+    def write_file(self):
+        np.savez(self.filename, sample_data=self.spectrum.sample_data)
+
 class CSVExporter(BaseExporter):
     _extension = 'csv'
     newline_chars = '\r\n'
@@ -65,15 +74,10 @@ class CSVExporter(BaseExporter):
         delim = self.delimiter_char
         frequency_format = self.frequency_format
         lines = []
-        for sample in self.spectrum.iter_samples():
-            if frequency_format is None:
-                f = sample.formatted_frequency
-            else:
-                f = frequency_format % (sample.frequency)
-            lines.append(delim.join([
-                f,
-                sample.formatted_dbFS
-            ]))
+        freqs = np.around(self.spectrum.sample_data['frequency'], decimals=3)
+        dB = np.around(self.spectrum.sample_data['dbFS'], decimals=1)
+        for f, v in zip(freqs, dB):
+            lines.append(delim.join([str(f), str(v)]))
         return newline_chars.join(lines)
 
 class BaseWWBExporter(BaseExporter):
@@ -96,13 +100,16 @@ class BaseWWBExporter(BaseExporter):
                 name=os.path.abspath(self.filename),
                 date=dt.strftime('%a %b %d %Y'),
                 time=dt.strftime('%H:%M:%S'),
-                color='#00ff00',
+                color=spectrum.color.to_hex(),
             ),
             data_sets=dict(
                 count='1',
                 no_data_value='-140',
             ),
         )
+        if spectrum.step_size is None:
+            spectrum.smooth(11)
+            spectrum.interpolate()
         d['data_set'] = dict(
             index='0',
             freq_units='KHz',
@@ -114,7 +121,7 @@ class BaseWWBExporter(BaseExporter):
             scale_factor='1',
             date=d['scan_data_source']['date'],
             time=d['scan_data_source']['time'],
-            date_time=str(int((dt - EPOCH).total_seconds())),
+            date_time=str(int((dt - EPOCH).total_seconds() * 1000)),
         )
         return d
     def build_data(self):
@@ -125,11 +132,13 @@ class BaseWWBExporter(BaseExporter):
         return tree
     def write_file(self):
         tree = self.build_data()
-        fd = StringIO()
+        fd = io.BytesIO()
         tree.write(fd, encoding='UTF-8', xml_declaration=True)
         doc = minidom.parseString(fd.getvalue())
         fd.close()
         s = doc.toprettyxml(encoding='UTF-8')
+        if isinstance(s, bytes):
+            s = s.decode('UTF-8')
         with open(self.filename, 'w') as f:
             f.write(s)
 
@@ -143,9 +152,11 @@ class WWBLegacyExporter(BaseWWBExporter):
         attribs = self.attribs
         data_sets = root.find('data_sets')
         data_set = ET.SubElement(data_sets, 'data_set', attribs['data_set'])
-        for sample in spectrum.iter_samples():
+        freqs = np.around(self.spectrum.sample_data['frequency'], decimals=3)
+        dB = np.around(self.spectrum.sample_data['dbFS'], decimals=1)
+        for val in dB:
             v = ET.SubElement(data_set, 'v')
-            v.text = sample.formatted_dbFS
+            v.text = str(val)
         return tree
 
 class WWBExporter(BaseWWBExporter):
@@ -157,9 +168,13 @@ class WWBExporter(BaseWWBExporter):
         data_sets = root.find('data_sets')
         freq_set = ET.SubElement(data_sets, 'freq_set')
         data_set = ET.SubElement(data_sets, 'data_set', self.attribs['data_set'])
-        for sample in spectrum.iter_samples():
+        freqs = self.spectrum.sample_data['frequency'] * 1000
+        dB = np.around(self.spectrum.sample_data['dbFS'], decimals=1)
+        nanix = np.flatnonzero(np.isnan(dB) | np.isinf(dB))
+        dB[nanix] = -140.
+        for freq, val in zip(freqs, dB):
             f = ET.SubElement(freq_set, 'f')
-            f.text = str(int(sample.frequency * 1000))
+            f.text = str(int(freq))
             v = ET.SubElement(data_set, 'v')
-            v.text = sample.formatted_dbFS
+            v.text = str(val)
         return tree

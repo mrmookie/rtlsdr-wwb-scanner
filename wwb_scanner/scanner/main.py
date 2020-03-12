@@ -2,6 +2,9 @@ import threading
 
 import numpy as np
 
+import logging
+logger = logging.getLogger(__name__)
+
 from wwb_scanner.core import JSONMixin
 from wwb_scanner.utils.dbstore import db_store
 from wwb_scanner.scanner.sdrwrapper import SdrWrapper
@@ -17,6 +20,25 @@ def mhz_to_hz(mhz):
     return mhz * 1000000.0
 def hz_to_mhz(hz):
     return hz / 1000000.0
+
+def get_freq_resolution(nfft, fs):
+    freqs = np.fft.fftfreq(nfft, 1/fs)
+    freqs = np.fft.fftshift(freqs)
+    r = np.unique(np.diff(np.around(freqs)))
+    if r.size != 1:
+        logger.error(f'!!! Not unique: {r}')
+        return r.mean()
+    return r[0]
+
+def is_equal_spacing(nfft, fs, step_size):
+    freqs = np.fft.fftfreq(nfft, 1/fs)
+    freqs = np.fft.fftshift(freqs)
+
+    freqs2 = freqs + step_size
+    all_freqs = np.unique(np.around(np.append(freqs, freqs2)))
+    diff = np.unique(np.diff(np.around(all_freqs)))
+    logger.debug(f'freq spacing diff={diff}')
+    return diff.size == 1
 
 class StopScanner(Exception):
     pass
@@ -54,7 +76,7 @@ class ScannerBase(JSONMixin):
             self.progress = (value - f_min) / (f_max - f_min)
         self.on_current_freq(value)
     def on_current_freq(self, value):
-        print 'scanning %s' % (value)
+        pass
     @property
     def progress(self):
         return self._progress
@@ -65,7 +87,7 @@ class ScannerBase(JSONMixin):
         self._progress = value
         self.on_progress(value)
     def on_progress(self, value):
-        print '%s%%' % (int(value * 100))
+        pass
     def build_sample_sets(self):
         freq,  end_freq = self.config.scan_range
         sample_collection = self.sample_collection
@@ -86,8 +108,6 @@ class ScannerBase(JSONMixin):
         self._running.clear()
         self.sample_collection.cancel()
         self._stopped.wait()
-    def scan_freq(self, freq):
-        pass
     def save_to_dbstore(self):
         self.spectrum.save_to_dbstore()
     def _serialize(self):
@@ -146,10 +166,32 @@ class Scanner(ScannerBase):
         c = self.sampling_config
         overlap = c.sweep_overlap_ratio
         self.sdr.sample_rate = c.sample_rate
-        rs = self.sdr.sample_rate
+        rs = int(round(self.sdr.sample_rate))
+
         self.sample_rate = rs
-        step_size = self._step_size = hz_to_mhz(rs / 2. * overlap)
+        nfft = self.window_size
+        resolution = get_freq_resolution(nfft, rs)
+
+        step_size = self._step_size = rs / 2. * overlap
+        self._equal_spacing = is_equal_spacing(nfft, rs, step_size)
+        if not self.equal_spacing:
+            step_size -= step_size % resolution
+            step_size = round(step_size)
+            if step_size <= 0:
+                step_size += resolution
+            self._equal_spacing = is_equal_spacing(nfft, rs, step_size)
+
+        step_size = hz_to_mhz(step_size)
+        self._step_size = step_size
+        logger.info(f'step_size: {step_size!r}, equal_spacing: {self._equal_spacing}')
         return step_size
+    @property
+    def equal_spacing(self):
+        r = getattr(self, '_equal_spacing', None)
+        if r is not None:
+            return r
+        _ = self.step_size
+        return self._equal_spacing
     @property
     def window_size(self):
         c = self.config
@@ -194,27 +236,22 @@ class Scanner(ScannerBase):
     def run_scan(self):
         with self.sdr_wrapper:
             super(Scanner, self).run_scan()
-    def scan_freq(self, freq):
-        sample_set = self.sample_collection.scan_freq(freq)
-        return sample_set
-    def on_sweep_processed(self, **kwargs):
-        pass
     def on_sample_set_processed(self, sample_set):
         powers = sample_set.powers
         freqs = sample_set.frequencies
         spectrum = self.spectrum
         center_freq = sample_set.center_frequency
-        print 'adding %s samples: range=%s - %s' % (len(freqs), min(freqs), max(freqs))
-        num_existing = 0
-        for f, p in zip(freqs, powers):
-            if f in spectrum.samples:
-                num_existing += 1
-            is_center = f == center_freq
-            spectrum.add_sample(frequency=f, iq=p, force_magnitude=True,
-                                force_lower_freq=False,
-                                is_center_frequency=is_center)
-        print('num_existing={}'.format(num_existing))
-        self.on_progress(self.progress)
+        if self.equal_spacing:
+            force_lower_freq = True
+        else:
+            force_lower_freq = False
+        spectrum.add_sample_set(
+            frequency=freqs,
+            magnitude=powers,
+            center_frequency=center_freq,
+            force_lower_freq=force_lower_freq,
+        )
+        self.progress = self.sample_collection.calc_progress()
 
 class ThreadedScanner(threading.Thread, Scanner):
     def __init__(self, **kwargs):
@@ -252,10 +289,6 @@ class ThreadedScanner(threading.Thread, Scanner):
                 break
             waiting.wait(scan_wait_timeout)
         stopped.set()
-    def scan_freq(self, freq):
-        if self.stopping.is_set():
-            return False
-        return super(ThreadedScanner, self).scan_freq(freq)
     def stop(self):
         self.stopping.set()
         self.waiting.set()

@@ -2,10 +2,14 @@ import threading
 import datetime
 import time
 
+import numpy as np
+from scipy import signal
+
 from wwb_scanner.core import JSONMixin
+from wwb_scanner.utils import dbmath
 from wwb_scanner.utils.dbstore import db_store
 from wwb_scanner.utils.color import Color
-from wwb_scanner.scan_objects import Sample, TimeBasedSample
+from wwb_scanner.scan_objects import SampleArray, Sample, TimeBasedSample
 try:
     from wwb_scanner import file_handlers
 except ImportError:
@@ -36,6 +40,11 @@ def get_spectrum_plot():
     return SpectrumPlot
 
 class Spectrum(JSONMixin):
+    _serialize_attrs = [
+        'name', 'color', 'timestamp_utc', 'step_size',
+        'center_frequencies', 'scan_config_eid',
+    ]
+    DEFAULT_COLOR = Color({'r':0, 'g':1, 'b':0, 'a':1})
     def __init__(self, **kwargs):
         self.name = kwargs.get('name')
         self.eid = kwargs.get('eid')
@@ -45,7 +54,15 @@ class Spectrum(JSONMixin):
             self.scan_config = config
         elif eid is not None:
             self.scan_config_eid = eid
-        self.color = Color(kwargs.get('color'))
+
+        color = kwargs.get('color')
+        if color is None:
+            color = self.DEFAULT_COLOR
+        if isinstance(color, Color):
+            self.color = color.copy()
+        else:
+            self.color = Color(color)
+
         datetime_utc = kwargs.get('datetime_utc')
         timestamp_utc = kwargs.get('timestamp_utc')
         if datetime_utc is not None:
@@ -56,8 +73,9 @@ class Spectrum(JSONMixin):
             self.timestamp_utc = timestamp_utc
         self.step_size = kwargs.get('step_size')
         self.data_updated = threading.Event()
-        self.data_update_lock = threading.Lock()
+        self.data_update_lock = threading.RLock()
         self.samples = {}
+        self.sample_data = SampleArray()
         self.center_frequencies = kwargs.get('center_frequencies', [])
     @property
     def datetime_utc(self):
@@ -120,16 +138,26 @@ class Spectrum(JSONMixin):
             if config.get('eid') is None:
                 config.eid = value
     def _deserialize(self, **kwargs):
-        samples = kwargs.get('samples', {})
-        if isinstance(samples, dict):
-            for key, data in samples.items():
-                if isinstance(data, dict):
-                    self.add_sample(**data)
-                else:
-                    self.add_sample(frequency=key, dbFS=data)
-        else:
-            for sample_kwargs in samples:
-                self.add_sample(**sample_kwargs)
+        sample_data = kwargs.get('sample_data')
+        samples = kwargs.get('samples')
+        if sample_data is not None:
+            self.sample_data = sample_data
+            self.samples.clear()
+            skwargs = dict(spectrum=self, init_complete=True)
+            for f in sample_data.frequency:
+                skwargs['frequency'] = f
+                sample = self._build_sample(**skwargs)
+                self.samples[f] = sample
+        elif samples is not None:
+            if isinstance(samples, dict):
+                for key, data in samples.items():
+                    if isinstance(data, dict):
+                        self.add_sample(**data)
+                    else:
+                        self.add_sample(frequency=key, dbFS=data)
+            else:
+                for sample_kwargs in samples:
+                    self.add_sample(**sample_kwargs)
     @classmethod
     def import_from_file(cls, filename):
         importer = get_importer()
@@ -143,25 +171,83 @@ class Spectrum(JSONMixin):
         plot = plot_cls(spectrum=self)
         plot.build_plot()
         return plot
+    def smooth(self, N):
+        with self.data_update_lock:
+            if N % 2 != 0:
+                N += 1
+            self.sample_data.smooth(N)
+        self.set_data_updated()
+    def interpolate(self, spacing=0.025):
+        with self.data_update_lock:
+            self.sample_data.interpolate(spacing)
+            self.samples.clear()
+            kwargs = {'spectrum':self, 'init_complete':True}
+            for freq in self.sample_data.frequency:
+                kwargs['frequency'] = freq
+                sample = self._build_sample(**kwargs)
+                self.samples[freq] = sample
+            self.step_size = spacing
+        self.set_data_updated()
+    def scale(self, min_dB, max_dB):
+        with self.data_update_lock:
+            y = self.sample_data['dbFS']
+            ymin = y.min()
+            ymax = y.max()
+            y -= ymin
+            out_scale = max_dB - min_dB
+
+            y /= y.max()
+            y *= out_scale
+            y += min_dB
+            self.sample_data['magnitude'] = dbmath.from_dB(y)
+            self.sample_data['dbFS'] = y
+        self.set_data_updated()
     def add_sample(self, **kwargs):
         f = kwargs.get('frequency')
+        iq = kwargs.get('iq')
+        if iq is not None and isinstance(iq, list):
+            iq = complex(*(float(v) for v in iq))
+            kwargs['iq'] = iq
         if kwargs.get('is_center_frequency') and f not in self.center_frequencies:
             self.center_frequencies.append(f)
         if f in self.samples:
             sample = self.samples[f]
             if kwargs.get('force_magnitude'):
-                for key in ['iq', 'magnitude', 'dbFS']:
-                    if key in kwargs:
-                        setattr(sample, key, kwargs[key])
-                        break
+                self.sample_data.set_fields(**kwargs)
             return sample
         if len(self.samples) and f < max(self.samples.keys()):
             if not kwargs.get('force_lower_freq', True):
                 return
-        kwargs.setdefault('spectrum', self)
-        sample = self._build_sample(**kwargs)
+        with self.data_update_lock:
+            if f not in self.sample_data['frequency']:
+                self.sample_data.set_fields(**kwargs)
+                skwargs = {'spectrum':self, 'init_complete':True, 'frequency':f}
+                sample = self._build_sample(**skwargs)
+                self.samples[f] = sample
         self.set_data_updated()
         return sample
+    def add_sample_set(self, **kwargs):
+        with self.data_update_lock:
+            self._add_sample_set(**kwargs)
+        self.set_data_updated()
+    def _add_sample_set(self, **kwargs):
+        force_lower_freq = kwargs.get('force_lower_freq')
+        a = SampleArray.create(**kwargs)
+
+        sdata = self.sample_data
+
+        if not force_lower_freq and sdata['frequency'].size:
+            r_ix = np.flatnonzero(np.greater_equal(a['frequency'], [sdata['frequency'].max()]))
+            a = a[r_ix]
+        self.sample_data.insert_sorted(a)
+
+        skwargs = {'spectrum':self, 'init_complete':True}
+        for f in a['frequency']:
+            if f in self.samples:
+                continue
+            skwargs['frequency'] = f
+            sample = self._build_sample(**skwargs)
+            self.samples[f] = sample
     def _build_sample(self, **kwargs):
         sample = Sample(**kwargs)
         self.samples[sample.frequency] = sample
@@ -186,8 +272,7 @@ class Spectrum(JSONMixin):
         if self.eid is None:
             return
         if not len(attrs):
-            attrs = ['name', 'color', 'timestamp_utc', 'step_size',
-                     'center_frequencies', 'scan_config_eid']
+            attrs = self._serialize_attrs
         d = {attr:getattr(self, attr) for attr in attrs}
         db_store.update_scan(self.eid, **d)
     @classmethod
@@ -199,11 +284,8 @@ class Spectrum(JSONMixin):
             eid = dbdata.eid
         return cls.from_json(dbdata, eid=eid)
     def _serialize(self):
-        attrs = ['name', 'color', 'timestamp_utc', 'step_size',
-                 'center_frequencies', 'scan_config_eid']
-        d = {attr: getattr(self, attr) for attr in attrs}
-        samples = self.samples
-        d['samples'] = {k: samples[k]._serialize() for k in samples.keys()}
+        d = {attr: getattr(self, attr) for attr in self._serialize_attrs}
+        d['sample_data'] = self.sample_data
         return d
 
 class TimeBasedSpectrum(Spectrum):

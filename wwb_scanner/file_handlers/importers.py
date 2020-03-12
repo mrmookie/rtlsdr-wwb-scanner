@@ -3,6 +3,8 @@ import datetime
 import xml.etree.ElementTree as ET
 import itertools
 
+import numpy as np
+
 from wwb_scanner.scan_objects import Spectrum
 
 class BaseImporter(object):
@@ -34,17 +36,34 @@ class BaseImporter(object):
     def parse_file_data(self):
         raise NotImplementedError('Method must be implemented by subclasses')
 
+class NumpyImporter(BaseImporter):
+    _extension = 'npz'
+    def __call__(self):
+        data = np.load(self.filename)
+        spectrum = self.spectrum
+        spectrum.name = os.path.basename(self.filename)
+        spectrum.add_sample_set(data=data['sample_data'])
+        return spectrum
+
+
 class CSVImporter(BaseImporter):
     delimiter_char = ','
     _extension = 'csv'
     def parse_file_data(self):
         spectrum = self.spectrum
-        for line in self.file_data.splitlines():
-            line = line.rstrip('\n').rstrip('\r')
-            if ',' not in line:
-                continue
-            f, v = line.split(',')
-            spectrum.add_sample(frequency=float(f), dbFS=float(v))
+        spectrum.name = os.path.basename(self.filename)
+        def iter_lines():
+            for line in self.file_data.splitlines():
+                line = line.rstrip('\n').rstrip('\r')
+                if ',' not in line:
+                    continue
+                f, v = line.split(',')
+                yield float(f)
+                yield float(v)
+        a = np.fromiter(iter_lines(), dtype=np.float64)
+        freqs = a[::2]
+        dB = a[1::2]
+        spectrum.add_sample_set(frequency=freqs, dbFS=dB)
 
 class BaseWWBImporter(BaseImporter):
     def load_file(self):
@@ -58,20 +77,19 @@ class WWBImporter(BaseWWBImporter):
         color = root.get('color')
         if color is not None:
             spectrum.color = spectrum.color.from_hex(color)
+        name = root.get('name')
+        if name is not None:
+            spectrum.name = name
         freq_set = root.find('*/freq_set')
         data_set = root.find('*/data_set')
         ts = data_set.get('date_time')
         if ts is not None:
-            try:
-                spectrum.timestamp_utc = float(ts)
-            except ValueError:
-                spectrum.timestamp_utc = float(ts) / 1000.
+            spectrum.timestamp_utc = float(ts) / 1000.
         else:
             dt_str = ' '.join([root.get('date'), root.get('time')])
             dt_fmt = '%a %b %d %Y %H:%M:%S'
             dt = datetime.datetime.strptime(dt_str, dt_fmt)
             spectrum.datetime_utc = dt
-        for ftag, vtag in itertools.izip(freq_set.iter('f'), data_set.iter('v')):
-            f = float(ftag.text) / 1000
-            v = float(vtag.text)
-            spectrum.add_sample(frequency=f, dbFS=v)
+        freqs = np.fromiter((float(t.text) / 1000. for t in freq_set), dtype=np.float)
+        dB = np.fromiter((float(t.text) for t in data_set), dtype=np.float64)
+        spectrum.add_sample_set(frequency=freqs, dbFS=dB)
